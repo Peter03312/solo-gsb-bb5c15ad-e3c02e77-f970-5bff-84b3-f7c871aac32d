@@ -201,6 +201,81 @@ def cycle_fingerprint(device_id: str, cycle_id: str,
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+# ---------------------------------------------------------------- 覆盖审计
+
+def validate_min_devices(value) -> int:
+    """覆盖门槛（最少设备数）：必须是正整数（布尔、浮点、字符串一律拒绝）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ApiError(400, "validation_error",
+                       "min_devices 必须是正整数（最少设备数）",
+                       {"value": value})
+    if value < 1:
+        raise ApiError(400, "validation_error",
+                       f"min_devices 必须是正整数，收到 {value}",
+                       {"value": value})
+    return value
+
+
+def compute_coverage(located: list[dict], start_ms: int, end_ms: int,
+                     min_devices: int) -> tuple[list[dict], list[dict]]:
+    """在半开查询区间 [start_ms, end_ms) 上计算多设备覆盖。
+
+    - 只计可定位声段：每段先与查询区间相交，区间外或零长度声段不贡献覆盖；
+    - 同一设备的多段重叠只算一台（按设备编号去重）；
+    - 按设备集合变化把查询区间切成最大半开片段（边界相接不重叠），
+      每段给出排序后的设备编号、数量与是否达标（设备数 >= min_devices）；
+    - 不足门槛的相邻片段合并为连续缺口；无数据时整段为缺口。
+    located 每项须含 device_id / utc_start_ms / utc_end_ms。
+    返回 (fragments, gaps)，fragments 完整铺满 [start_ms, end_ms)。
+    """
+    # 扫描线事件：time -> {device_id: 计数增量}（半开区间：起点 +1，终点 -1）
+    events: dict[int, dict[str, int]] = {}
+    for s in located:
+        a = max(s["utc_start_ms"], start_ms)
+        b = min(s["utc_end_ms"], end_ms)
+        if a >= b:
+            continue  # 区间外或零长度：不贡献覆盖
+        dev = s["device_id"]
+        ev = events.setdefault(a, {})
+        ev[dev] = ev.get(dev, 0) + 1
+        ev = events.setdefault(b, {})
+        ev[dev] = ev.get(dev, 0) - 1
+    boundaries = [start_ms]
+    boundaries += sorted(t for t in events if start_ms < t < end_ms)
+    boundaries.append(end_ms)
+
+    fragments: list[dict] = []
+    active: dict[str, int] = {}
+    for i in range(len(boundaries) - 1):
+        lo, hi = boundaries[i], boundaries[i + 1]
+        for dev, delta in events.get(lo, {}).items():
+            cnt = active.get(dev, 0) + delta
+            if cnt > 0:
+                active[dev] = cnt
+            else:
+                active.pop(dev, None)
+        devices = sorted(active)
+        if fragments and fragments[-1]["devices"] == devices:
+            fragments[-1]["end_ms"] = hi  # 设备集合未变：并入上一段（最大片段）
+            continue
+        fragments.append({"start_ms": lo, "end_ms": hi, "devices": devices,
+                          "device_count": len(devices),
+                          "meets_threshold": len(devices) >= min_devices})
+
+    gaps: list[dict] = []
+    for f in fragments:
+        if f["meets_threshold"]:
+            continue
+        if gaps and gaps[-1]["end_ms"] == f["start_ms"]:
+            gaps[-1]["end_ms"] = f["end_ms"]  # 相邻缺口合并
+            gaps[-1]["max_device_count"] = max(gaps[-1]["max_device_count"],
+                                               f["device_count"])
+        else:
+            gaps.append({"start_ms": f["start_ms"], "end_ms": f["end_ms"],
+                         "max_device_count": f["device_count"]})
+    return fragments, gaps
+
+
 # ---------------------------------------------------------------- 版本差异
 
 def compute_changes(prev_list: list[dict], curr_list: list[dict]) -> dict:

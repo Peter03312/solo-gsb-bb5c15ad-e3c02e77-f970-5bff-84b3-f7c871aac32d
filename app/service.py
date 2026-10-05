@@ -18,17 +18,24 @@
 声明预期原周期与目标周期，任一项无效即整批拒绝（不改动任何数据）；
 成功后声段起止/备注/创建时间/采集编号不变，内容指纹按新周期重算，
 各声段按目标周期锚点重算定位，相关周期内容指纹随之更新。
+
+覆盖审计（coverage audit，v1.4）：现场复核时判断指定 UTC 毫秒区间内
+是否始终有足够的不同设备录到声音。默认基于当前时间轴（读事务一致快照、
+实时重算）；携带 version_no 时只依据该已发布版本冻结的声段投影，后续
+锚点/周期变更不影响历史结果。本接口只读，无效输入或版本不存在明确拒绝。
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from . import db
-from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_UNLOCATABLE,
-                    compute_changes, cycle_fingerprint, project_segment,
+from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
+                    STATUS_UNLOCATABLE, compute_changes, compute_coverage,
+                    cycle_fingerprint, project_segment,
                     require_fields, require_payload, segment_content_hash,
                     sort_projections, validate_cycle_id, validate_fingerprint,
-                    validate_id, validate_ms, validate_note)
+                    validate_id, validate_min_devices, validate_ms,
+                    validate_note)
 from .db import SCHEMA_VERSION
 
 
@@ -775,6 +782,65 @@ def reassign_segment_cycles(db_path: str, body):
     return 200, {"moved": len(moves), "segments": projs, "cycles": cycle_fps,
                  "message": "周期归属已批量纠正：声段起止、备注、创建时间与采集编号"
                             "保持不变，已按目标周期锚点重算定位"}
+
+
+# ---------------------------------------------------------------- 覆盖审计
+
+def coverage_audit(db_path: str, body):
+    """覆盖审计：判断指定 UTC 毫秒区间内是否始终有足够的不同设备录到声音。
+
+    - 查询区间为半开区间 [start_ms, end_ms)，时间为 int64 毫秒且起点小于终点，
+      min_devices 为正整数；无效输入 -> 400，版本不存在 -> 404，均不改变数据；
+    - 省略 version_no：审计当前时间轴（读事务内取一致快照，按现有锚点实时重算）；
+      携带 version_no：只依据该已发布版本冻结的声段投影，后续锚点更正、
+      周期归属纠正、声段增删都不会改动历史审计结果；
+    - 只计可定位声段并与查询区间相交；同设备重叠只算一台；零长度不贡献覆盖；
+    - 返回按设备集合变化切成的最大半开片段（排序设备编号、数量、是否达标）
+      与不足门槛的连续缺口（相邻已合并；无数据时整段为缺口）。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["start_ms", "end_ms", "min_devices"])
+    start_ms = validate_ms(payload["start_ms"], "start_ms")
+    end_ms = validate_ms(payload["end_ms"], "end_ms")
+    min_devices = validate_min_devices(payload["min_devices"])
+    if start_ms >= end_ms:
+        raise ApiError(400, "invalid_range",
+                       f"查询区间起点 start_ms={start_ms} 必须小于终点 "
+                       f"end_ms={end_ms}（半开区间 [start_ms, end_ms)）",
+                       {"start_ms": start_ms, "end_ms": end_ms})
+    version_no = payload.get("version_no")
+    if version_no is not None:
+        if isinstance(version_no, bool) or not isinstance(version_no, int):
+            raise ApiError(400, "validation_error",
+                           "version_no 必须是正整数（已发布版本号）",
+                           {"value": version_no})
+        if version_no < 1:
+            raise ApiError(404, "version_not_found",
+                           f"版本 {version_no} 不存在", {"version_no": version_no})
+    with db.session(db_path) as conn, db.read_txn(conn):
+        if version_no is None:
+            # 当前视图：同一读事务内取一致快照并实时重算投影
+            rows = conn.execute("SELECT * FROM segments ORDER BY capture_id").fetchall()
+            located = [p for p in _project_all(conn, rows)
+                       if p["status"] == STATUS_LOCATED]
+            scope = "current"
+        else:
+            # 历史审计：只依据该版本已冻结的声段投影
+            v = conn.execute("SELECT version_no FROM versions WHERE version_no=?",
+                             (version_no,)).fetchone()
+            if not v:
+                raise ApiError(404, "version_not_found",
+                               f"版本 {version_no} 不存在", {"version_no": version_no})
+            located = [dict(r) for r in conn.execute(
+                "SELECT device_id, utc_start_ms, utc_end_ms FROM version_segments "
+                "WHERE version_no=? AND status=?", (version_no, STATUS_LOCATED))]
+            scope = "version"
+        fragments, gaps = compute_coverage(located, start_ms, end_ms, min_devices)
+    return 200, {"scope": scope, "version_no": version_no,
+                 "start_ms": start_ms, "end_ms": end_ms,
+                 "min_devices": min_devices,
+                 "fully_covered": not gaps,
+                 "fragments": fragments, "gaps": gaps}
 
 
 # ---------------------------------------------------------------- 当前时间轴

@@ -7,6 +7,7 @@
 - **时钟周期（cycle，v1.1 新增）**：设备每次重启本地毫秒归零，可按"周期"登记编号；不同周期可复用同一本地毫秒值，锚点递增校验与线性映射**按周期独立执行**，声段只使用所属周期的锚点。旧库启动即自动迁移，**已发布旧版本查询结果完全不变**。
 - **周期封存（seal，v1.2 新增）**：现场核对完成后可封存单台设备的一个周期——封存请求携带周期详情中的内容指纹，在同一事务内核对当前内容、且全部声段可定位才生效；封存后该周期锚点/声段变更一律拒绝，防止晚到记录改动已确认时间线；封存不可撤销。旧库周期默认未封存。
 - **周期归属批量纠正（reassign，v1.3 新增）**：现场整理时发现一批声段被记到错误的设备时钟周期，可按采集编号批量把它们在**同一设备的已登记周期**之间移动；每项声明预期原周期与目标周期，任一项无效（编号不存在/同批重复/原周期不符/目标未登记/源或目标已封存/原周期等于目标周期）即**整批拒绝、不改动任何数据**；成功后起止本地毫秒、备注、创建时间与采集编号保持不变，各声段按目标周期锚点重算定位，相关周期内容指纹随之更新；已发布版本保持原快照，之后发布的版本反映新归属。
+- **覆盖审计（coverage audit，v1.4 新增）**：现场复核时判断指定 UTC 毫秒区间内是否始终有足够的不同设备录到声音——按半开区间 `[start_ms,end_ms)` 与最少设备数，只计可定位声段并与查询区间相交（同设备重叠只算一台），按设备集合变化切成最大半开片段并合并不足门槛的连续缺口；可审计当前时间轴（一致快照）或指定已发布版本（只依据冻结声段，后续锚点/周期变更不影响历史结果）；接口只读，无效输入或版本不存在明确拒绝。
 
 ## 快速开始
 
@@ -90,6 +91,42 @@ python3 -m app          # 自动建库建表（默认 ./data/timeline.db），�
 - **成功响应（200）**：`segments` 为各声段按**目标周期锚点**计算的当前定位结果（目标周期覆盖不足仍为 `unlocatable`）；`cycles` 为相关周期（源+目标）**更新后的内容指纹**，与周期详情一致，可直接用于后续封存核对。
 - **与既有规则共存**：纠正后同编号重传仍遵守**同内容幂等、异内容冲突**（按新周期计内容指纹：新周期同内容重传幂等，按旧周期重传 → `409 capture_conflict`）；已发布版本保持原快照，之后发布的版本反映新归属（`changes.displaced` 体现投影位移）；批量纠正与锚点更正、封存、版本发布在同一写锁下串行执行，快照不会撕裂。
 
+### 覆盖审计（coverage audit）
+
+现场复核一段录音时，判断指定 UTC 毫秒区间内是否始终有足够的不同设备录到声音：
+
+- **接口**：`POST /coverage/audit`，请求体 `{"start_ms", "end_ms", "min_devices", "version_no"?}`，只读，不改变任何数据。
+- **输入规则**：查询区间为**半开区间** `[start_ms, end_ms)`；时间须为 `0 ~ 2^63-1` 的整数毫秒（非法 → `400 invalid_time`）且**起点小于终点**（否则 `400 invalid_range`）；`min_devices` 须为**正整数**（否则 `400 validation_error`）；`version_no` 类型非法 → `400 validation_error`，版本不存在 → `404 version_not_found`。无效输入一律明确拒绝。
+- **数据源**：省略 `version_no` 时审计**当前时间轴**——同一读事务内取一致快照、按现有锚点实时重算；携带 `version_no` 时只依据该**已发布版本冻结的声段投影**——后续锚点更正、周期归属纠正、声段增删都**不会改动历史审计结果**。
+- **覆盖口径**：只计**可定位**声段，将其与查询区间相交；同一设备的重叠声段只算一台；边界相接不重叠；零长度声段不贡献覆盖。
+- **响应（200）**：
+  - `fragments`：按设备集合变化切成的**最大半开片段**，完整铺满查询区间；每段含排序后的 `devices`、`device_count` 与 `meets_threshold`（设备数 ≥ 门槛）；
+  - `gaps`：不足门槛的**连续缺口**（相邻缺口已合并），含 `max_device_count`；**无数据时整段为缺口**；
+  - `fully_covered`：整段始终达标（无缺口）时为 `true`——即"始终有足够设备"的直接答案。
+
+响应示例（当前时间轴，至少 2 台设备）：
+
+```json
+{
+  "scope": "current",
+  "version_no": null,
+  "start_ms": 1700000000000,
+  "end_ms": 1700000020000,
+  "min_devices": 2,
+  "fully_covered": false,
+  "fragments": [
+    {"start_ms": 1700000000000, "end_ms": 1700000004283, "devices": ["D2"], "device_count": 1, "meets_threshold": false},
+    {"start_ms": 1700000004283, "end_ms": 1700000006000, "devices": ["D1", "D2"], "device_count": 2, "meets_threshold": true},
+    {"start_ms": 1700000006000, "end_ms": 1700000019408, "devices": ["D1"], "device_count": 1, "meets_threshold": false},
+    {"start_ms": 1700000019408, "end_ms": 1700000020000, "devices": [], "device_count": 0, "meets_threshold": false}
+  ],
+  "gaps": [
+    {"start_ms": 1700000000000, "end_ms": 1700000004283, "max_device_count": 1},
+    {"start_ms": 1700000006000, "end_ms": 1700000020000, "max_device_count": 1}
+  ]
+}
+```
+
 ### 线性漂移映射
 
 每台设备、**每个时钟周期**的锚点按本地时间排序后，在相邻锚点 `(l0,u0)`、`(l1,u1)` 间线性映射：
@@ -168,6 +205,7 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | GET | `/segments` / `/segments/{capture_id}` | 声段列表（可加 `?device_id=&cycle_id=`）/ 单个 |
 | DELETE | `/segments/{capture_id}` | 删除声段（下一版体现为"移除"） |
 | GET | `/timeline/current` | 当前时间轴（按现有锚点实时重算，显示周期归属） |
+| POST | `/coverage/audit` | **覆盖审计** `{start_ms, end_ms, min_devices, version_no?}`（只读） |
 | POST | `/versions` | 发布新版本（可选 `{"note": "..."}`），冻结各周期锚点与投影 |
 | GET | `/versions` / `/versions/{n}` | 版本列表 / 版本完整快照与差异（旧版本无周期字段） |
 
@@ -330,6 +368,30 @@ curl -s -X POST $BASE/segments/reassign-cycle -H 'Content-Type: application/json
   -d '{"items":[{"capture_id":"CAP-0001","from_cycle_id":"default","to_cycle_id":"boot-3"}]}'
 ```
 
+### 覆盖审计（现场复核：区间内是否始终有足够设备）
+
+```bash
+BASE=http://localhost:8000
+
+# 1. 审计当前时间轴：[t0, t1) 内是否始终有至少 2 台不同设备录到声音
+curl -s -X POST $BASE/coverage/audit -H 'Content-Type: application/json' \
+  -d '{"start_ms":1700000000000,"end_ms":1700000020000,"min_devices":2}'
+# => fragments 按设备集合变化切最大半开片段（每段含排序设备编号、数量、是否达标）；
+#    gaps 为不足 2 台的连续缺口（相邻已合并）；fully_covered=false 表示并非始终达标
+
+# 2. 审计已发布版本：只依据 v1 冻结的声段投影，后续锚点/周期变更不影响
+curl -s -X POST $BASE/coverage/audit -H 'Content-Type: application/json' \
+  -d '{"start_ms":1700000000000,"end_ms":1700000020000,"min_devices":2,"version_no":1}'
+
+# 3. 非法输入与版本不存在：明确拒绝且不改变数据
+curl -s -X POST $BASE/coverage/audit -H 'Content-Type: application/json' \
+  -d '{"start_ms":1700000020000,"end_ms":1700000000000,"min_devices":2}'   # 400 invalid_range
+curl -s -X POST $BASE/coverage/audit -H 'Content-Type: application/json' \
+  -d '{"start_ms":0,"end_ms":1000,"min_devices":0}'                        # 400 validation_error
+curl -s -X POST $BASE/coverage/audit -H 'Content-Type: application/json' \
+  -d '{"start_ms":0,"end_ms":1000,"min_devices":1,"version_no":999}'       # 404 version_not_found
+```
+
 完整演示脚本（覆盖幂等、冲突、越界、排序、版本差异）：
 
 ```bash
@@ -391,16 +453,18 @@ python3 -m unittest discover -s tests -v
 - `tests/test_api.py`（17 个）：锚点严格递增校验、非法时间、起止倒置、幂等/冲突、线性漂移与取整、无法定位、排序规则、版本不可变、位移/新增/移除、以及**更正与发布并发**下快照完整性；
 - `tests/test_cycles.py`（19 个）：周期登记幂等/冲突、默认周期、跨周期复用本地毫秒、各周期独立递增与独立映射、声段仅用所属周期锚点（覆盖不足仍 `unlocatable`）、周期不存在拒绝不写入、采集编号全局唯一且**周期计入内容**、时间轴/新版显示周期归属、发布原子冻结各周期、以及 **v1 旧库在线迁移**（已有数据归 default、旧声段默认周期重传仍幂等、已发布旧版本查询结果逐字段不变、迁移后发布为周期格式）；
 - `tests/test_seal.py`（18 个）：周期详情指纹与封存状态、指纹稳定性与内容敏感性、封存成功返回封存时间与最终指纹、重复封存返回首次结果、封存不可撤销、指纹过期/不可定位声段拒绝且状态不变、封存后锚点与声段写保护、同内容重传幂等与异内容冲突保持既有规则、涉封存周期的更正整体拒绝且其他周期不受影响、与版本发布共存、**旧库迁移后周期默认未封存且可正常封存**；
-- `tests/test_reassign.py`（18 个）：批量纠正成功与字段保持、跨设备批次、互换周期、目标覆盖不足仍不可定位、时间轴/列表/计数同步、相关周期指纹更新而无关周期不变、纠正后重传幂等/冲突规则、编号不存在/同批重复/原周期不符/目标未登记（含跨设备同名）/源或目标已封存/原周期等于目标周期的整批拒绝且不改动数据、已发布版本不变而新版反映新归属、以及**纠正+锚点更正+发布并发**下快照自洽。
+- `tests/test_reassign.py`（18 个）：批量纠正成功与字段保持、跨设备批次、互换周期、目标覆盖不足仍不可定位、时间轴/列表/计数同步、相关周期指纹更新而无关周期不变、纠正后重传幂等/冲突规则、编号不存在/同批重复/原周期不符/目标未登记（含跨设备同名）/源或目标已封存/原周期等于目标周期的整批拒绝且不改动数据、已发布版本不变而新版反映新归属、以及**纠正+锚点更正+发布并发**下快照自洽；
+- `tests/test_coverage.py`（16 个）：覆盖审计——半开区间相交与边界裁剪、设备集合变化切最大片段、同设备重叠只算一台、边界相接不重叠、零长度/不可定位声段不计、相邻缺口合并、无数据整段缺口、非法时间/起点不小于终点/门槛非正整数/版本不存在明确拒绝且不改数据、**已发布版本审计结果不受后续锚点更正与周期纠正影响**、以及**审计与更正/发布并发**下历史结果稳定。
 
-## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3）
+## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3 → v1.4）
 
 - 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动识别并在线迁移旧库，无需手工操作；
 - 旧设备自动补登 `default` 周期；旧锚点与声段一律归入 `default`；旧声段内容指纹按含周期的新口径重算（默认周期同内容重传仍为幂等）；
 - `anchors` / `version_anchors` 主键扩展为含 `cycle_id`（整表重建，数据保留）；`segments` / `version_segments` 增加 `cycle_id` 列；
 - 已发布旧版本标记为 `format_rev=1` 且周期列为空，`GET /versions/{n}` 返回结果与升级前完全一致；升级后新发布为 `format_rev=2`；
 - v1.2 起 `cycles` 表增加 `sealed_at` / `seal_fingerprint` 两列，旧库启动时自动补列，**旧周期一律默认未封存**，未封存周期的所有行为与升级前一致；
-- v1.3 新增 `POST /segments/reassign-cycle` 批量纠正端点，**无表结构变更**，旧库直接可用。
+- v1.3 新增 `POST /segments/reassign-cycle` 批量纠正端点，**无表结构变更**，旧库直接可用；
+- v1.4 新增 `POST /coverage/audit` 覆盖审计端点（只读），**无表结构变更**，旧库直接可用。
 
 ## 项目结构
 
@@ -408,14 +472,15 @@ python3 -m unittest discover -s tests -v
 app/
   __main__.py   # 入口：初始化数据库 + 启动 HTTP 服务
   server.py     # HTTP 路由、JSON 编解码、错误响应（http.server）
-  service.py    # 服务层：各 API 操作（单事务校验+写入）
-  logic.py      # 纯逻辑：校验、线性漂移映射、排序、版本差异、周期内容指纹
+  service.py    # 服务层：各 API 操作（单事务校验+写入；覆盖审计只读快照）
+  logic.py      # 纯逻辑：校验、线性漂移映射、排序、版本差异、周期内容指纹、覆盖审计扫描线
   db.py         # SQLite 连接、建表、旧库迁移（v1 整表迁移 + 封存列补齐）、事务助手（WAL）
 tests/test_api.py      # 端到端测试（原有能力，保持兼容）
 tests/test_cycles.py   # 端到端测试（时钟周期 + 旧库迁移/旧版本不变）
 tests/test_seal.py     # 端到端测试（周期封存 + 旧库默认未封存）
 tests/test_reassign.py # 端到端测试（周期归属批量纠正 + 并发一致性）
-examples/demo.sh       # curl 调用示例（含周期、封存与批量纠正用法）
-examples/client.py     # Python 客户端示例（含周期、封存与批量纠正用法）
+tests/test_coverage.py # 端到端测试（覆盖审计：片段/缺口/输入校验/历史冻结/并发）
+examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正与覆盖审计用法）
+examples/client.py     # Python 客户端示例（含周期、封存、批量纠正与覆盖审计用法）
 Dockerfile / docker-compose.yml
 ```
