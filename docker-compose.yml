@@ -1,0 +1,19 @@
+# 一键启动：docker compose up --build
+# 服务地址：http://localhost:8000
+services:
+  timeline:
+    build: .
+    image: timeline-align:latest
+    container_name: timeline-align
+    ports:
+      - "8000:8000"          # 宿主机端口:容器端口，可改左侧
+    environment:
+      TIMELINE_HOST: 0.0.0.0
+      TIMELINE_PORT: "8000"
+      TIMELINE_DB_PATH: /data/timeline.db
+    volumes:
+      - timeline-data:/data  # SQLite 数据持久化
+    restart: unless-stopped
+
+volumes:
+  timeline-data:
