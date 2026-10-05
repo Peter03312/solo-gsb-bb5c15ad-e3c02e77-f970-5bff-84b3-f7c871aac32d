@@ -104,6 +104,18 @@ class TimelineClient:
     def version(self, version_no: int):
         return self._call("GET", f"/versions/{version_no}")
 
+    # 覆盖审计
+    def coverage_audit(self, start_ms: int, end_ms: int, min_devices: int,
+                       version_no: int | None = None):
+        """覆盖审计：判断半开区间 [start_ms, end_ms) 内是否始终有至少
+        min_devices 台不同设备录到声音。省略 version_no 审计当前时间轴，
+        指定则审计该已发布版本冻结的声段投影（历史结果不可变）。"""
+        payload = {"start_ms": start_ms, "end_ms": end_ms,
+                   "min_devices": min_devices}
+        if version_no is not None:
+            payload["version_no"] = version_no
+        return self._call("POST", "/coverage/audit", payload)
+
 
 def show(title: str, status: int, body: dict) -> None:
     print(f"\n=== {title} (HTTP {status}) ===")
@@ -223,6 +235,25 @@ def main() -> None:
     #     未封存周期（boot-2）不受影响
     show("未封存周期正常写入",
          *cli.submit_segment("CAP-0101", "D1", 6000, 8000, cycle_id="boot-2"))
+
+    # 12. 覆盖审计：判断指定 UTC 区间内是否始终有足够不同设备录到声音
+    #     只计可定位声段；同设备重叠只算一台；按设备集合变化切最大半开片段；
+    #     不足门槛的相邻片段合并为缺口
+    show("覆盖审计：当前时间轴（至少 2 台）",
+         *cli.coverage_audit(1699999997000, 1700000062000, 2))
+    show("覆盖审计：当前时间轴（至少 1 台）",
+         *cli.coverage_audit(1699999997000, 1700000062000, 1))
+    #     指定 version_no 审计历史版本：只依据发布时冻结的声段投影，
+    #     之后的锚点更正、声段增删、周期变更都不会改动历史结果
+    show("覆盖审计：历史版本 v1（冻结快照）",
+         *cli.coverage_audit(1699999997000, 1700000062000, 2, version_no=1))
+    #     无效输入：起点不小于终点 / 门槛非正整数 / 版本不存在 -> 拒绝且不改数据
+    show("起点不小于终点（400 invalid_range）",
+         *cli.coverage_audit(2000, 1000, 1))
+    show("门槛非正整数（400 invalid_threshold）",
+         *cli.coverage_audit(0, 1000, 0))
+    show("版本不存在（404 version_not_found）",
+         *cli.coverage_audit(0, 1000, 1, version_no=999))
 
 
 if __name__ == "__main__":

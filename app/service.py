@@ -24,11 +24,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from . import db
-from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_UNLOCATABLE,
-                    compute_changes, cycle_fingerprint, project_segment,
+from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
+                    STATUS_UNLOCATABLE, compute_changes, compute_coverage,
+                    cycle_fingerprint, project_segment,
                     require_fields, require_payload, segment_content_hash,
                     sort_projections, validate_cycle_id, validate_fingerprint,
-                    validate_id, validate_ms, validate_note)
+                    validate_id, validate_min_devices, validate_ms,
+                    validate_note)
 from .db import SCHEMA_VERSION
 
 
@@ -806,6 +808,69 @@ def current_timeline(db_path: str):
         projs = _project_all(conn, rows)
         return 200, {"generated_at": iso_now(), "devices": devices,
                      "segments": projs, "segment_count": len(projs)}
+
+
+# ---------------------------------------------------------------- 覆盖审计
+
+def coverage_audit(db_path: str, body):
+    """覆盖审计：判断指定 UTC 毫秒半开区间内是否始终有足够不同设备录到声音。
+
+    - 请求体 {start_ms, end_ms, min_devices, version_no?}：审计半开区间
+      [start_ms, end_ms)，min_devices 为最少设备数（正整数）；
+    - 省略 version_no：审计当前时间轴，整个计算在单个读事务的一致快照上进行；
+      指定 version_no：审计该已发布版本冻结的声段投影——历史审计只依据
+      已冻结声段，后续锚点更正、周期变更或新发布都不会改动历史结果；
+    - 只计可定位声段，与查询区间相交；同设备的重叠声段只算一台；
+      边界相接不重叠，零长度片段不贡献覆盖；无数据时整段为缺口；
+    - 本接口只读：无效输入或版本不存在即明确拒绝，任何情况下都不改动数据。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["start_ms", "end_ms", "min_devices"])
+    start_ms = validate_ms(payload["start_ms"], "start_ms")
+    end_ms = validate_ms(payload["end_ms"], "end_ms")
+    if start_ms >= end_ms:
+        raise ApiError(400, "invalid_range",
+                       f"查询区间起点 start_ms={start_ms} 必须小于终点 "
+                       f"end_ms={end_ms}（半开区间 [start_ms, end_ms)）",
+                       {"start_ms": start_ms, "end_ms": end_ms})
+    min_devices = validate_min_devices(payload["min_devices"])
+    version_no = payload.get("version_no")
+    if version_no is not None:
+        if isinstance(version_no, bool) or not isinstance(version_no, int) \
+                or version_no < 1:
+            raise ApiError(400, "validation_error",
+                           "version_no 必须是正整数（已发布版本号），"
+                           "省略或 null 表示审计当前时间轴",
+                           {"value": version_no})
+    with db.session(db_path) as conn, db.read_txn(conn):
+        if version_no is None:
+            # 当前时间轴：读事务内一致快照，按现有锚点实时投影
+            rows = conn.execute("SELECT * FROM segments ORDER BY capture_id").fetchall()
+            anchors = _anchors_map(conn)
+            located = []
+            for r in rows:
+                proj = project_segment(
+                    _row_to_segment(r),
+                    anchors.get((r["device_id"], r["cycle_id"]), ([], [])))
+                if proj["status"] == STATUS_LOCATED:
+                    located.append(proj)
+            source = "current"
+        else:
+            v = conn.execute(
+                "SELECT version_no FROM versions WHERE version_no=?",
+                (version_no,)).fetchone()
+            if not v:
+                raise ApiError(404, "version_not_found",
+                               f"版本 {version_no} 不存在", {"version_no": version_no})
+            # 历史审计只依据发布时冻结的声段投影，与之后的锚点/周期变更无关
+            located = [dict(r) for r in conn.execute(
+                "SELECT device_id, utc_start_ms, utc_end_ms FROM version_segments "
+                "WHERE version_no=? AND status=?", (version_no, STATUS_LOCATED))]
+            source = "version"
+    result = compute_coverage(located, start_ms, end_ms, min_devices)
+    return 200, {"source": source, "version_no": version_no,
+                 "start_ms": start_ms, "end_ms": end_ms,
+                 "min_devices": min_devices, **result}
 
 
 # ---------------------------------------------------------------- 版本发布

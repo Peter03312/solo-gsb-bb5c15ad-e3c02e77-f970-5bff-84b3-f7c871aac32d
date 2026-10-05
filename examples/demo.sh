@@ -202,3 +202,28 @@ echo; echo "== 未封存周期（D2/boot-2）不受影响；封存后发布版�
 curl -s -X POST "$BASE/segments" -H 'Content-Type: application/json' \
   -d '{"capture_id":"CAP-0102","device_id":"D2","cycle_id":"boot-2","local_start_ms":10000,"local_end_ms":20000}' | pp
 curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' -d '{"note":"default 周期已封存"}' | pp
+
+# ----------------------------------------------------------------------
+# 覆盖审计（coverage audit）：判断指定 UTC 区间内是否始终有足够不同设备在录音
+# ----------------------------------------------------------------------
+
+echo; echo "== 覆盖审计：当前时间轴（半开区间 [start_ms,end_ms) + 最少设备数）=="
+echo "-- 只计可定位声段；同设备重叠只算一台；按设备集合变化切最大片段；相邻缺口合并 --"
+curl -s -X POST "$BASE/coverage/audit" -H 'Content-Type: application/json' \
+  -d '{"start_ms":1699999997000,"end_ms":1700000062000,"min_devices":2}' | pp
+
+echo; echo "== 覆盖审计：门槛 1 台（整段是否始终至少一台设备在录）=="
+curl -s -X POST "$BASE/coverage/audit" -H 'Content-Type: application/json' \
+  -d '{"start_ms":1699999997000,"end_ms":1700000062000,"min_devices":1}' | pp
+
+echo; echo "== 覆盖审计：指定已发布版本（历史审计只依据冻结声段，后续变更不影响）=="
+curl -s -X POST "$BASE/coverage/audit" -H 'Content-Type: application/json' \
+  -d '{"start_ms":1699999997000,"end_ms":1700000062000,"min_devices":2,"version_no":1}' | pp
+
+echo; echo "== 非法审计请求：起点不小于终点 / 门槛非正整数 / 版本不存在（均拒绝且不改数据）=="
+curl -s -X POST "$BASE/coverage/audit" -H 'Content-Type: application/json' \
+  -d '{"start_ms":2000,"end_ms":1000,"min_devices":1}' | pp
+curl -s -X POST "$BASE/coverage/audit" -H 'Content-Type: application/json' \
+  -d '{"start_ms":0,"end_ms":1000,"min_devices":0}' | pp
+curl -s -X POST "$BASE/coverage/audit" -H 'Content-Type: application/json' \
+  -d '{"start_ms":0,"end_ms":1000,"min_devices":1,"version_no":999}' | pp

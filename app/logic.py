@@ -106,6 +106,19 @@ def validate_fingerprint(value) -> str:
     return value
 
 
+def validate_min_devices(value) -> int:
+    """覆盖审计门槛 min_devices：正整数（布尔、浮点、字符串、零、负数一律拒绝）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ApiError(400, "invalid_threshold",
+                       "min_devices 必须是正整数（最少设备数）",
+                       {"value": value})
+    if value < 1:
+        raise ApiError(400, "invalid_threshold",
+                       f"min_devices 必须是正整数，收到 {value}",
+                       {"value": value})
+    return value
+
+
 # ---------------------------------------------------------------- 漂移映射
 
 def _interpolate(l0: int, u0: int, l1: int, u1: int, t: int) -> int:
@@ -237,3 +250,99 @@ def compute_changes(prev_list: list[dict], curr_list: list[dict]) -> dict:
             })
     displaced.sort(key=lambda d: (d["device_id"], d["capture_id"]))
     return {"added": added, "removed": removed, "displaced": displaced}
+
+
+# ---------------------------------------------------------------- 覆盖审计
+
+def _merge_device_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """同一设备的区间并集：重叠或边界相接（半开语义下首尾相等）的区间合并。"""
+    merged: list[list[int]] = []
+    for a, b in sorted(intervals):
+        if merged and a <= merged[-1][1]:
+            if b > merged[-1][1]:
+                merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def compute_coverage(located: list[dict], start_ms: int, end_ms: int,
+                     min_devices: int) -> dict:
+    """覆盖审计纯逻辑：判断半开区间 [start_ms, end_ms) 内是否始终有足够
+    不同设备录到声音。
+
+    - located：可定位声段投影（至少含 device_id / utc_start_ms / utc_end_ms）；
+      只取与查询区间相交的非零长度部分，零长度声段不贡献覆盖；
+    - 同设备的重叠（含相接）声段只算一台：先按设备求区间并集；
+    - 事件扫描把查询区间切成设备集合恒定的最大半开片段，每片段给出排序后的
+      设备编号、数量与是否达标；不足门槛的相邻片段合并为连续缺口；
+    - 边界相接不重叠：结束于 t 的声段不覆盖 t 之后，开始于 t 的恰好接上；
+    - 无相交声段时整段为一个缺口。
+    """
+    per_device: dict[str, list[tuple[int, int]]] = {}
+    contributing = 0
+    for s in located:
+        a = max(s["utc_start_ms"], start_ms)
+        b = min(s["utc_end_ms"], end_ms)
+        if a < b:  # 空交集与零长度片段不贡献覆盖
+            per_device.setdefault(s["device_id"], []).append((a, b))
+            contributing += 1
+
+    # 事件点：t 时刻先移除结束于 t 的设备、再加入开始于 t 的设备，
+    # 得到 [t, 下一事件点) 上恒定的设备集合（半开语义：边界相接不重叠）。
+    starts: dict[int, set[str]] = {}
+    ends: dict[int, set[str]] = {}
+    points = {start_ms, end_ms}
+    for device_id, intervals in per_device.items():
+        for a, b in _merge_device_intervals(intervals):
+            starts.setdefault(a, set()).add(device_id)
+            ends.setdefault(b, set()).add(device_id)
+            points.add(a)
+            points.add(b)
+    timeline = sorted(points)
+
+    fragments: list[dict] = []
+    active: set[str] = set()
+    for i, t in enumerate(timeline):
+        for d in ends.get(t, ()):
+            active.discard(d)
+        for d in starts.get(t, ()):
+            active.add(d)
+        if i + 1 < len(timeline) and timeline[i + 1] > t:
+            fragments.append({"start_ms": t, "end_ms": timeline[i + 1],
+                              "device_ids": sorted(active),
+                              "device_count": len(active)})
+
+    # 相邻且设备集合相同的片段合并为最大半开片段
+    maximal: list[dict] = []
+    for f in fragments:
+        if maximal and maximal[-1]["device_ids"] == f["device_ids"]:
+            maximal[-1]["end_ms"] = f["end_ms"]
+        else:
+            maximal.append(dict(f))
+    for f in maximal:
+        f["meets_threshold"] = f["device_count"] >= min_devices
+
+    # 缺口：连续不达标片段合并；记录段内出现过的设备（并集）与峰值设备数
+    gaps: list[dict] = []
+    for f in maximal:
+        if f["meets_threshold"]:
+            continue
+        if gaps and gaps[-1]["end_ms"] == f["start_ms"]:
+            g = gaps[-1]
+            g["end_ms"] = f["end_ms"]
+            g["device_ids"] = sorted(set(g["device_ids"]) | set(f["device_ids"]))
+            g["max_device_count"] = max(g["max_device_count"], f["device_count"])
+        else:
+            gaps.append({"start_ms": f["start_ms"], "end_ms": f["end_ms"],
+                         "device_ids": list(f["device_ids"]),
+                         "max_device_count": f["device_count"]})
+
+    covered_ms = sum(f["end_ms"] - f["start_ms"] for f in maximal
+                     if f["meets_threshold"])
+    return {"ok": not gaps,
+            "covered_ms": covered_ms,
+            "gap_ms": (end_ms - start_ms) - covered_ms,
+            "located_segment_count": contributing,
+            "fragments": maximal,
+            "gaps": gaps}
